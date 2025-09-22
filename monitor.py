@@ -74,8 +74,10 @@ def get_config_from_file():
 def load_config():
     config = get_config_from_github()
     
-    if not config:
-        logger.info("Trying local config file")
+    if config:
+        logger.info("Using config from GitHub")
+    else:
+        logger.info("GitHub config not available, trying local config file")
         config = get_config_from_file()
     
     if not config:
@@ -87,7 +89,7 @@ def load_config():
             json.dump(config, f, indent=2)
         logger.info("Config synced to local file")
     except Exception as e:
-        logger.error(f"Error writing local config: {e}")
+        logger.warning(f"Could not write local config: {e}")
     
     return config
 
