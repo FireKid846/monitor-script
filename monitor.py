@@ -2,7 +2,8 @@ import os
 import json
 import asyncio
 import time
-import requests
+import urllib.request
+import urllib.parse
 import base64
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
@@ -39,21 +40,21 @@ def get_config_from_github():
     
     try:
         url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-        headers = {
-            'Authorization': f'token {GITHUB_TOKEN}',
-            'User-Agent': 'TelegramMonitor'
-        }
         
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            file_data = response.json()
-            content = base64.b64decode(file_data['content']).decode('utf-8')
-            config = json.loads(content)
-            logger.info("Config loaded from GitHub")
-            return config
-        else:
-            logger.error(f"GitHub API error: {response.status_code}")
-            return {}
+        request = urllib.request.Request(url)
+        request.add_header('Authorization', f'token {GITHUB_TOKEN}')
+        request.add_header('User-Agent', 'TelegramMonitor')
+        
+        with urllib.request.urlopen(request) as response:
+            if response.status == 200:
+                file_data = json.loads(response.read().decode())
+                content = base64.b64decode(file_data['content']).decode('utf-8')
+                config = json.loads(content)
+                logger.info("Config loaded from GitHub")
+                return config
+            else:
+                logger.error(f"GitHub API error: {response.status}")
+                return {}
     except Exception as e:
         logger.error(f"Error loading from GitHub: {e}")
         return {}
