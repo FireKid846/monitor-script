@@ -2,6 +2,8 @@ import os
 import json
 import asyncio
 import time
+import requests
+import base64
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
@@ -10,10 +12,18 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-API_ID = int(os.getenv('API_ID'))
+API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 PHONE_NUMBER = os.getenv('PHONE_NUMBER')
-CONFIG_URL = os.getenv('CONFIG_URL', 'http://localhost:3000/api/config')
+GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+GITHUB_REPO = os.getenv('GITHUB_REPO')
+GITHUB_FILE_PATH = os.getenv('GITHUB_FILE_PATH', 'users.json')
+
+if not API_ID or not API_HASH or not PHONE_NUMBER:
+    logger.error("Missing required environment variables: API_ID, API_HASH, PHONE_NUMBER")
+    exit(1)
+
+API_ID = int(API_ID)
 
 client = TelegramClient('session_name', API_ID, API_HASH)
 
@@ -22,16 +32,63 @@ current_config = {}
 monitored_entities = set()
 last_forward_times = {}
 
+def get_config_from_github():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        logger.warning("GitHub not configured")
+        return {}
+    
+    try:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+        headers = {
+            'Authorization': f'token {GITHUB_TOKEN}',
+            'User-Agent': 'TelegramMonitor'
+        }
+        
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            file_data = response.json()
+            content = base64.b64decode(file_data['content']).decode('utf-8')
+            config = json.loads(content)
+            logger.info("Config loaded from GitHub")
+            return config
+        else:
+            logger.error(f"GitHub API error: {response.status_code}")
+            return {}
+    except Exception as e:
+        logger.error(f"Error loading from GitHub: {e}")
+        return {}
+
 def get_config_from_file():
     try:
-        with open('config.json', 'r') as f:
+        with open('users.json', 'r') as f:
+            logger.info("Config loaded from local file")
             return json.load(f)
     except FileNotFoundError:
-        logger.error("config.json not found")
+        logger.warning("Local users.json not found")
         return {}
     except Exception as e:
-        logger.error(f"Error reading config: {e}")
+        logger.error(f"Error reading local config: {e}")
         return {}
+
+def load_config():
+    config = get_config_from_github()
+    
+    if not config:
+        logger.info("Trying local config file")
+        config = get_config_from_file()
+    
+    if not config:
+        logger.error("No config found anywhere")
+        return {}
+    
+    try:
+        with open('users.json', 'w') as f:
+            json.dump(config, f, indent=2)
+        logger.info("Config synced to local file")
+    except Exception as e:
+        logger.error(f"Error writing local config: {e}")
+    
+    return config
 
 def should_forward_message(text, keywords):
     if not text or not keywords:
@@ -92,7 +149,7 @@ async def update_statistics(forwarded=False, keyword_triggered=False):
         if keyword_triggered:
             config['statistics']['keywords_triggered'] += 1
         
-        with open('config.json', 'w') as f:
+        with open('users.json', 'w') as f:
             json.dump(config, f, indent=2)
     except Exception as e:
         logger.error(f"Error updating statistics: {e}")
