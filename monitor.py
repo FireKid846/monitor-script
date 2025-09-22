@@ -233,18 +233,9 @@ async def start_client():
     await client.start(phone=PHONE_NUMBER)
     
     if not await client.is_user_authorized():
-        logger.info("Client not authorized, starting auth flow")
-        await client.send_code_request(PHONE_NUMBER)
-        
-        try:
-            code = input('Enter the code you received: ')
-            await client.sign_in(PHONE_NUMBER, code)
-        except SessionPasswordNeededError:
-            password = input('Enter your 2FA password: ')
-            await client.sign_in(password=password)
-        except PhoneCodeInvalidError:
-            logger.error("Invalid phone code")
-            return
+        logger.error("Client not authorized! You need to authenticate locally first.")
+        logger.error("Run this script locally, authenticate, then upload the session file to your server.")
+        return False
     
     logger.info("Client authorized successfully")
     
@@ -258,6 +249,7 @@ async def start_client():
     asyncio.create_task(keep_alive())
     
     await client.run_until_disconnected()
+    return True
 
 def main():
     try:
