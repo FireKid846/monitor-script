@@ -172,11 +172,13 @@ async def get_entity_by_name(name):
 
 async def forward_message_to_group(message, destination_group):
     try:
+        logger.info(f"🔍 Starting forward attempt to: {destination_group}")
         dest_entity = await get_entity_by_name(destination_group)
         if not dest_entity:
             logger.error(f"Could not find destination group: {destination_group}")
             return False
         
+        logger.info(f"🔍 About to forward message. Dest entity: {dest_entity}")
         await client.forward_messages(dest_entity, message)
         logger.info(f"Message forwarded to {destination_group}")
         return True
@@ -269,6 +271,8 @@ async def handle_new_message(event):
     if not should_forward_message(message_text, keywords):
         return
     
+    logger.info(f"🔍 Keyword match found! Message: '{message_text}' | Keywords: {keywords}")
+    
     cooldown = current_config.get('cooldown', 2)
     if not check_cooldown(event.chat_id, cooldown):
         logger.info(f"⏳ Cooldown active for chat {event.chat_id}")
@@ -278,6 +282,8 @@ async def handle_new_message(event):
     if not destination:
         logger.error("❌ No destination group configured in users.json")
         return
+    
+    logger.info(f"🔍 Destination: '{destination}' | Chat ID: {event.chat_id}")
     
     await update_statistics(keyword_triggered=True)
     
