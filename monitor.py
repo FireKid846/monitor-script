@@ -36,6 +36,7 @@ client = TelegramClient('session_name', API_ID, API_HASH)
 last_config_check = 0
 current_config = {}
 monitored_entities = set()
+monitored_entity_objects = []  # Store actual entity objects
 last_forward_times = {}
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -173,12 +174,14 @@ async def get_entity_by_name(name):
 async def forward_message_to_group(message, destination_group):
     try:
         logger.info(f"🔍 Starting forward attempt to: {destination_group}")
+        
         dest_entity = await get_entity_by_name(destination_group)
         if not dest_entity:
             logger.error(f"Could not find destination group: {destination_group}")
             return False
         
-        logger.info(f"🔍 About to forward message. Dest entity: {dest_entity}")
+        logger.info(f"🔍 About to forward message. Dest entity: {dest_entity.title if hasattr(dest_entity, 'title') else dest_entity}")
+        
         await client.forward_messages(dest_entity, message)
         logger.info(f"Message forwarded to {destination_group}")
         return True
@@ -207,7 +210,7 @@ async def update_statistics(forwarded=False, keyword_triggered=False):
         logger.error(f"Error updating statistics: {e}")
 
 async def setup_monitoring():
-    global monitored_entities, current_config
+    global monitored_entities, monitored_entity_objects, current_config
     
     config = load_config()
     current_config = config
@@ -222,13 +225,18 @@ async def setup_monitoring():
         return
     
     new_entities = set()
+    new_entity_objects = []
+    
+    # Clear existing handlers
+    client.remove_event_handler(handle_new_message)
     
     channels = config.get('channels', {})
     for tag, channel_data in channels.items():
         entity = await get_entity_by_name(channel_data['name'])
         if entity:
             new_entities.add(entity.id)
-            logger.info(f"✅ Monitoring channel: {channel_data['name']}")
+            new_entity_objects.append(entity)
+            logger.info(f"✅ Monitoring channel: {channel_data['name']} (ID: {entity.id})")
         else:
             logger.error(f"❌ Could not access channel: {channel_data['name']}")
     
@@ -237,38 +245,43 @@ async def setup_monitoring():
         entity = await get_entity_by_name(group_data['name'])
         if entity:
             new_entities.add(entity.id)
-            logger.info(f"✅ Monitoring group: {group_data['name']}")
+            new_entity_objects.append(entity)
+            logger.info(f"✅ Monitoring group: {group_data['name']} (ID: {entity.id})")
         else:
             logger.error(f"❌ Could not access group: {group_data['name']}")
     
     monitored_entities = new_entities
+    monitored_entity_objects = new_entity_objects
     
-    if monitored_entities:
+    if monitored_entity_objects:
+        # Register event handler with specific chats
+        logger.info(f"🔧 Registering event handler for {len(monitored_entity_objects)} entities")
+        client.add_event_handler(handle_new_message, events.NewMessage(chats=monitored_entity_objects))
         logger.info(f"🚀 MONITORING ACTIVE - Watching {len(monitored_entities)} entities for keywords: {config.get('keywords', [])}")
     else:
         logger.warning("⚠️  No entities are being monitored. Check your channel/group names in users.json")
 
-@client.on(events.NewMessage)
 async def handle_new_message(event):
-    global last_config_check, current_config
+    global current_config
     
-    current_time = time.time()
-    if current_time - last_config_check > 30:
-        await setup_monitoring()
-        last_config_check = current_time
+    logger.info(f"🔍 NEW MESSAGE DETECTED! Chat ID: {event.chat_id}")
     
     if not current_config.get('monitoring_active', False):
-        return
-    
-    if event.chat_id not in monitored_entities:
+        logger.info("🔍 Monitoring inactive, ignoring message")
         return
     
     message_text = event.message.message
     if not message_text:
+        logger.info("🔍 No message text, ignoring")
         return
     
+    logger.info(f"🔍 Message text: '{message_text}'")
+    
     keywords = current_config.get('keywords', [])
+    logger.info(f"🔍 Checking against keywords: {keywords}")
+    
     if not should_forward_message(message_text, keywords):
+        logger.info("🔍 No keyword match, ignoring message")
         return
     
     logger.info(f"🔍 Keyword match found! Message: '{message_text}' | Keywords: {keywords}")
@@ -289,9 +302,11 @@ async def handle_new_message(event):
     
     success = await forward_message_to_group(event.message, destination)
     if success:
-        last_forward_times[event.chat_id] = current_time
+        last_forward_times[event.chat_id] = time.time()
         await update_statistics(forwarded=True)
         logger.info(f"📬 Forwarded message from {event.chat_id}")
+    else:
+        logger.error("❌ Failed to forward message")
 
 async def self_ping():
     if RENDER_EXTERNAL_URL:
@@ -311,6 +326,11 @@ async def keep_alive():
         await asyncio.sleep(600)
         await self_ping()
 
+async def periodic_config_check():
+    while True:
+        await asyncio.sleep(30)
+        await setup_monitoring()
+
 async def start_client():
     try:
         await client.start(phone=PHONE_NUMBER)
@@ -329,7 +349,9 @@ async def start_client():
         
         logger.info("🔄 Starting message monitoring loop...")
         
+        # Start background tasks
         asyncio.create_task(keep_alive())
+        asyncio.create_task(periodic_config_check())
         
         await client.run_until_disconnected()
         return True
