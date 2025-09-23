@@ -5,10 +5,13 @@ import time
 import urllib.request
 import urllib.parse
 import base64
+import requests
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 import logging
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +22,8 @@ PHONE_NUMBER = os.getenv('PHONE_NUMBER')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_REPO = os.getenv('GITHUB_REPO')
 GITHUB_FILE_PATH = os.getenv('GITHUB_FILE_PATH', 'users.json')
+PORT = int(os.getenv('PORT', 3000))
+RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL')
 
 if not API_ID or not API_HASH or not PHONE_NUMBER:
     logger.error("Missing required environment variables: API_ID, API_HASH, PHONE_NUMBER")
@@ -33,9 +38,47 @@ current_config = {}
 monitored_entities = set()
 last_forward_times = {}
 
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'Telegram Monitor is running')
+    
+    def log_message(self, format, *args):
+        pass
+
+def start_health_server():
+    server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+    server.serve_forever()
+
+def create_default_config():
+    """Create a default configuration if none exists"""
+    default_config = {
+        "monitoring_active": False,
+        "keywords": ["urgent", "important", "alert"],
+        "cooldown": 2,
+        "destination_group": "",
+        "channels": {},
+        "groups": {},
+        "statistics": {
+            "messages_forwarded": 0,
+            "keywords_triggered": 0,
+            "last_reset": datetime.now().isoformat()
+        }
+    }
+    
+    try:
+        with open('users.json', 'w') as f:
+            json.dump(default_config, f, indent=2)
+        logger.info("Created default users.json configuration file")
+        return default_config
+    except Exception as e:
+        logger.error(f"Could not create default config: {e}")
+        return default_config
+
 def get_config_from_github():
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        logger.warning("GitHub not configured")
         return {}
     
     try:
@@ -53,43 +96,47 @@ def get_config_from_github():
                 logger.info("Config loaded from GitHub")
                 return config
             else:
-                logger.error(f"GitHub API error: {response.status}")
+                logger.warning(f"GitHub API returned status: {response.status}")
                 return {}
     except Exception as e:
-        logger.error(f"Error loading from GitHub: {e}")
+        logger.warning(f"Could not load from GitHub (using local config): {e}")
         return {}
 
 def get_config_from_file():
     try:
         with open('users.json', 'r') as f:
+            config = json.load(f)
             logger.info("Config loaded from local file")
-            return json.load(f)
+            return config
     except FileNotFoundError:
-        logger.warning("Local users.json not found")
-        return {}
+        logger.info("Local users.json not found, creating default configuration")
+        return create_default_config()
     except Exception as e:
         logger.error(f"Error reading local config: {e}")
-        return {}
+        return create_default_config()
 
 def load_config():
     config = get_config_from_github()
     
     if config:
         logger.info("Using config from GitHub")
+        try:
+            with open('users.json', 'w') as f:
+                json.dump(config, f, indent=2)
+            logger.info("GitHub config synced to local file")
+        except Exception as e:
+            logger.warning(f"Could not sync GitHub config to local file: {e}")
     else:
-        logger.info("GitHub config not available, trying local config file")
+        logger.info("Using local configuration")
         config = get_config_from_file()
     
-    if not config:
-        logger.error("No config found anywhere")
-        return {}
+    if not isinstance(config.get('monitoring_active'), bool):
+        config['monitoring_active'] = False
+        logger.warning("Fixed monitoring_active field in config")
     
-    try:
-        with open('users.json', 'w') as f:
-            json.dump(config, f, indent=2)
-        logger.info("Config synced to local file")
-    except Exception as e:
-        logger.warning(f"Could not write local config: {e}")
+    if not isinstance(config.get('keywords'), list):
+        config['keywords'] = ["urgent", "important"]
+        logger.warning("Fixed keywords field in config")
     
     return config
 
@@ -160,11 +207,16 @@ async def update_statistics(forwarded=False, keyword_triggered=False):
 async def setup_monitoring():
     global monitored_entities, current_config
     
-    config = get_config_from_file()
+    config = load_config()
     current_config = config
     
     if not config.get('monitoring_active', False):
-        logger.info("Monitoring is not active")
+        logger.warning("⚠️  Monitoring is INACTIVE - Set 'monitoring_active': true in users.json to enable")
+        logger.info("Current config status:")
+        logger.info(f"  - Keywords: {config.get('keywords', [])}")
+        logger.info(f"  - Destination: {config.get('destination_group', 'Not set')}")
+        logger.info(f"  - Channels: {len(config.get('channels', {}))}")
+        logger.info(f"  - Groups: {len(config.get('groups', {}))}")
         return
     
     new_entities = set()
@@ -174,17 +226,25 @@ async def setup_monitoring():
         entity = await get_entity_by_name(channel_data['name'])
         if entity:
             new_entities.add(entity.id)
-            logger.info(f"Monitoring channel: {channel_data['name']}")
+            logger.info(f"✅ Monitoring channel: {channel_data['name']}")
+        else:
+            logger.error(f"❌ Could not access channel: {channel_data['name']}")
     
     groups = config.get('groups', {})
     for tag, group_data in groups.items():
         entity = await get_entity_by_name(group_data['name'])
         if entity:
             new_entities.add(entity.id)
-            logger.info(f"Monitoring group: {group_data['name']}")
+            logger.info(f"✅ Monitoring group: {group_data['name']}")
+        else:
+            logger.error(f"❌ Could not access group: {group_data['name']}")
     
     monitored_entities = new_entities
-    logger.info(f"Now monitoring {len(monitored_entities)} entities")
+    
+    if monitored_entities:
+        logger.info(f"🚀 MONITORING ACTIVE - Watching {len(monitored_entities)} entities for keywords: {config.get('keywords', [])}")
+    else:
+        logger.warning("⚠️  No entities are being monitored. Check your channel/group names in users.json")
 
 @client.on(events.NewMessage)
 async def handle_new_message(event):
@@ -211,12 +271,12 @@ async def handle_new_message(event):
     
     cooldown = current_config.get('cooldown', 2)
     if not check_cooldown(event.chat_id, cooldown):
-        logger.info(f"Cooldown active for chat {event.chat_id}")
+        logger.info(f"⏳ Cooldown active for chat {event.chat_id}")
         return
     
     destination = current_config.get('destination_group')
     if not destination:
-        logger.error("No destination group configured")
+        logger.error("❌ No destination group configured in users.json")
         return
     
     await update_statistics(keyword_triggered=True)
@@ -225,42 +285,66 @@ async def handle_new_message(event):
     if success:
         last_forward_times[event.chat_id] = current_time
         await update_statistics(forwarded=True)
-        logger.info(f"Forwarded message from {event.chat_id}")
+        logger.info(f"📬 Forwarded message from {event.chat_id}")
+
+async def self_ping():
+    if RENDER_EXTERNAL_URL:
+        try:
+            response = requests.get(RENDER_EXTERNAL_URL, timeout=30)
+            if response.status_code == 200:
+                logger.info("✅ Self-ping successful")
+            else:
+                logger.warning(f"❌ Self-ping failed: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"❌ Self-ping error: {str(e)}")
+    else:
+        logger.info("💓 Keep-alive ping (no external URL configured)")
 
 async def keep_alive():
     while True:
         await asyncio.sleep(600)
-        logger.info("Self ping - keeping client alive")
+        await self_ping()
 
 async def start_client():
-    await client.start(phone=PHONE_NUMBER)
-    
-    if not await client.is_user_authorized():
-        logger.error("Client not authorized! You need to authenticate locally first.")
-        logger.error("Run this script locally, authenticate, then upload the session file to your server.")
+    try:
+        await client.start(phone=PHONE_NUMBER)
+        
+        if not await client.is_user_authorized():
+            logger.error("❌ Client not authorized! You need to authenticate locally first.")
+            logger.error("Run this script locally, authenticate, then upload the session file to your server.")
+            return False
+        
+        logger.info("✅ Client authorized successfully")
+        
+        me = await client.get_me()
+        logger.info(f"👤 Logged in as {me.first_name} ({me.username})")
+        
+        await setup_monitoring()
+        
+        logger.info("🔄 Starting message monitoring loop...")
+        
+        asyncio.create_task(keep_alive())
+        
+        await client.run_until_disconnected()
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error in start_client: {e}")
         return False
-    
-    logger.info("Client authorized successfully")
-    
-    me = await client.get_me()
-    logger.info(f"Logged in as {me.first_name} ({me.username})")
-    
-    await setup_monitoring()
-    
-    logger.info("Starting message monitoring...")
-    
-    asyncio.create_task(keep_alive())
-    
-    await client.run_until_disconnected()
-    return True
 
 def main():
     try:
+        logger.info("🚀 Starting Telegram Monitor Bot")
+        logger.info(f"📡 Health check server starting on port {PORT}")
+        
+        health_thread = threading.Thread(target=start_health_server, daemon=True)
+        health_thread.start()
+        
         asyncio.run(start_client())
     except KeyboardInterrupt:
-        logger.info("Stopping client...")
+        logger.info("⚠️  Bot stopped by user")
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"💥 Fatal error: {e}")
 
 if __name__ == '__main__':
     main()
